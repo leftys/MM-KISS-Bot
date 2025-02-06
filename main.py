@@ -41,7 +41,7 @@ def parse_arguments():
     )
     parser.add_argument(
         "--account-password",
-        type = str,
+        type = str, 
         default = "",
         help = "Set the account password"
     )
@@ -54,7 +54,7 @@ def get_account(account_password: str) -> Account:
     account = Account(
         client = client,
         address = WALLET_ADDRESS,
-        key_pair = KeyPair.from_keystore(PATH_TO_KEYSTORE, account_password),
+        key_pair = KeyPair.from_keystore(PATH_TO_KEYSTORE, account_password.encode('utf-8')),
         chain = StarknetChainId[NETWORK]
     )
     logging.info("Succesfully loaded account.")
@@ -126,8 +126,13 @@ def get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price):
     to_be_canceled = []
     to_be_created = []
 
-    base_decimals = DECIMALS[market_cfg[1]['base_token']]  # for example ETH
-    quote_decimals = DECIMALS[market_cfg[1]['quote_token']]  # for example USDC
+    try:
+        base_decimals = DECIMALS[market_cfg[1]['base_token', 18]]  # for example ETH
+        quote_decimals = DECIMALS[market_cfg[1]['quote_token', 18]]  # for example USDC
+    except KeyError:
+        # testnet
+        base_decimals = 18
+        quote_decimals = 18
     
     for side, side_name in [(asks, 'ask'), (bids, 'bid')]:
         to_be_canceled_side = []
@@ -183,9 +188,13 @@ def get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price):
 
 
 async def update_quotes(account: Account, market_cfg, remus_contract, to_be_canceled, to_be_created, base_token_contract, quote_token_contract):
-    
-    base_decimals = DECIMALS[market_cfg[1]['base_token']]  # for example ETH
-    quote_decimals = DECIMALS[market_cfg[1]['quote_token']]  # for example USDC
+    try:
+        base_decimals = DECIMALS[market_cfg[1]['base_token', 18]]  # for example ETH
+        quote_decimals = DECIMALS[market_cfg[1]['quote_token', 18]]  # for example USDC
+    except KeyError:
+        # testnet
+        base_decimals = 18
+        quote_decimals = 18
     
     nonce = await account.get_nonce()
     for i, order in enumerate(to_be_canceled):
