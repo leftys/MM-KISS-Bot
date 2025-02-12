@@ -3,24 +3,16 @@ import argparse
 import asyncio
 import logging
 import requests
-import sys
 
 from starknet_py.net.full_node_client import FullNodeClient
-# from starknet_py.hash.selector import get_selector_from_name
-# from starknet_py.net.client_models import Call
 from starknet_py.contract import Contract
 from starknet_py.net.account.account import Account
 from starknet_py.net.signer.stark_curve_signer import KeyPair
 from starknet_py.net.models.chains import StarknetChainId
-# from starknet_py.utils.typed_data import EnumParameter
-# from starknet_py.net.client_models import ResourceBounds
 
 from cfg import REMUS_ADDRESS, STARKNET_RPC, WALLET_ADDRESS, SOURCE_DATA, NETWORK, MARKET_MAKER_CFG, MAX_FEE, DECIMALS
 
-
-
 PATH_TO_KEYSTORE = "keystore.json"
-
 
 
 def setup_logging(log_level: str):
@@ -84,14 +76,16 @@ async def claim_tokens(market_cfg, remus_contract) -> None:
             token_address = token_address,
             user_address = WALLET_ADDRESS
         )
-        logging.info(f'Claimable amount is {claimable} for token {token_address}.')
+        # logging.info(f'Claimable amount is {claimable} for token {token_address}.')
         if claimable[0]:
-            logging.info(f'Claiming')
+            logging.info(f'Claiming {claimable} for token {token_address}.')
             claim = await remus_contract.functions['claim'].invoke_v1(
                 token_address = token_address,
                 amount = claimable[0],
                 max_fee = MAX_FEE
             )
+            # TODO should we wait for acceptance?
+            # await claim.wait_for_acceptance()
         logging.info(f'Claim done.')
 
 
@@ -115,13 +109,13 @@ async def get_position(market_cfg, account, asks, bids, base_token_contract, quo
     return total_possible_position_base, total_possible_position_quote
 
 
-def get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price):
+async def get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price, total_possible_position_base, total_possible_position_quote, spread):
     """
     If an existing quote has lower than market_maker_cfg['minimal_remaining_quote_size'] quantity, it is requoted.
     
-    Optimal quote is in market_maker_cfg['target_relative_distance_from_FP'] distance from the FP, where FP is binance price.
-    The order is never perfect and market_maker_cfg['max_error_relative_distance_from_FP'] from optimal quote price level is allowed, meaning
-    that an old quote is canceled and new one created if the distance is outside of what is ok.
+    Order sizes are adjusted based on position imbalances:
+    - If we have surplus of base tokens, increase bid sizes to reduce base token holdings
+    - If we have surplus of quote tokens, increase ask sizes to reduce quote token holdings
     """
     to_be_canceled = []
     to_be_created = []
@@ -134,6 +128,25 @@ def get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price):
         base_decimals = 18
         quote_decimals = 18
     
+    max_error = market_maker_cfg['max_error_to_spread'] * spread
+
+    # Calculate position imbalances in quote currency
+    base_value = total_possible_position_base * fair_price
+    quote_value = total_possible_position_quote
+    total_value = base_value + quote_value
+    
+    # Calculate size multipliers based on imbalances
+    # If perfectly balanced, both multipliers will be 1.0
+    # Maximum skew is 50% (multiplier range: 0.5 to 1.5)
+    base_ratio = base_value / total_value if total_value > 0 else 0.5
+    quote_ratio = quote_value / total_value if total_value > 0 else 0.5
+    
+    bid_size_multiplier = 1.5 - base_ratio  # More bids when base_ratio is low
+    ask_size_multiplier = 1.5 - quote_ratio  # More asks when quote_ratio is low
+    
+    logging.info(f"Position ratios - Base: {base_ratio:.2f}, Quote: {quote_ratio:.2f}")
+    logging.info(f"Size multipliers - Bids: {bid_size_multiplier:.2f}, Asks: {ask_size_multiplier:.2f}")
+    
     for side, side_name in [(asks, 'ask'), (bids, 'bid')]:
         to_be_canceled_side = []
         to_be_created_side = []
@@ -145,9 +158,9 @@ def get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price):
                 to_be_canceled_side.append(order)
                 continue
             if (
-                (1 - market_maker_cfg['max_error_relative_distance_from_FP'] > order['price'] / 10**base_decimals / fair_price)
+                (1 - max_error > order['price'] / 10**base_decimals / fair_price)
                 or
-                (order['price'] / 10**base_decimals / fair_price > 1 + market_maker_cfg['max_error_relative_distance_from_FP'])
+                (order['price'] / 10**base_decimals / fair_price > 1 + max_error)
             ):
                 logging.info(f"Canceling order because of incorrect price. fair_price: {fair_price}, order price: {order['price'] / 10**base_decimals}")
                 logging.debug(f"Canceling order because of incorrect price. order: {order}")
@@ -164,15 +177,18 @@ def get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price):
         # Create order if there is no order
         if len(to_be_canceled_side) == len(side):
             if side_name == 'ask':
-                optimal_price = int(fair_price * (1 + market_maker_cfg['target_relative_distance_from_FP']) * 10**base_decimals)
+                optimal_price = int(fair_price * (1 + spread) * 10**base_decimals)
                 optimal_price = optimal_price // market_cfg[1]['tick_size']
                 optimal_price = optimal_price * market_cfg[1]['tick_size'] + market_cfg[1]['tick_size']
+                size_multiplier = ask_size_multiplier
             else:
-                optimal_price = int(fair_price * (1 - market_maker_cfg['target_relative_distance_from_FP']) * 10**base_decimals)
+                optimal_price = int(fair_price * (1 - spread) * 10**base_decimals)
                 optimal_price = optimal_price // market_cfg[1]['tick_size']
                 optimal_price = optimal_price * market_cfg[1]['tick_size']
+                size_multiplier = bid_size_multiplier
     
-            optimal_amount = market_maker_cfg['order_dollar_size'] / (optimal_price / 10**base_decimals) 
+            # Apply size multiplier to adjust for imbalances
+            optimal_amount = market_maker_cfg['order_dollar_size'] * size_multiplier / (optimal_price / 10**base_decimals)
             optimal_amount = optimal_amount // market_cfg[1]['lot_size']
             optimal_amount = optimal_amount * market_cfg[1]['lot_size']
     
@@ -187,18 +203,35 @@ def get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price):
     return to_be_canceled, to_be_created
 
 
-async def update_quotes(account: Account, market_cfg, remus_contract, to_be_canceled, to_be_created, base_token_contract, quote_token_contract):
-    try:
-        base_decimals = DECIMALS[market_cfg[1]['base_token', 18]]  # for example ETH
-        quote_decimals = DECIMALS[market_cfg[1]['quote_token', 18]]  # for example USDC
-    except KeyError:
-        # testnet
-        base_decimals = 18
-        quote_decimals = 18
+async def setup_unlimited_approvals(account: Account, remus_contract, market_cfg, base_token_contract, quote_token_contract):
+    """Set up unlimited approvals for base and quote tokens."""
+    logging.info("Setting up unlimited approvals for tokens...")
+    max_uint = 2**256 - 1
+    nonce = await account.get_nonce()
     
+    # Approve base token
+    await (await base_token_contract.functions['approve'].invoke_v1(
+        spender=int(REMUS_ADDRESS, 16),
+        amount=max_uint,
+        max_fee=MAX_FEE,
+        nonce=nonce
+    )).wait_for_acceptance()
+    logging.info(f"Set unlimited approval for base token: {market_cfg[1]['base_token']}")
+    
+    # Approve quote token
+    await (await quote_token_contract.functions['approve'].invoke_v1(
+        spender=int(REMUS_ADDRESS, 16),
+        amount=max_uint,
+        max_fee=MAX_FEE,
+        nonce=nonce + 1
+    )).wait_for_acceptance()
+    logging.info(f"Set unlimited approval for quote token: {market_cfg[1]['quote_token']}")
+
+
+async def update_quotes(account: Account, market_cfg, remus_contract, to_be_canceled, to_be_created, base_token_contract, quote_token_contract):
     nonce = await account.get_nonce()
     for i, order in enumerate(to_be_canceled):
-        (await remus_contract.functions['delete_maker_order'].invoke_v1(
+        await (await remus_contract.functions['delete_maker_order'].invoke_v1(
             maker_order_id=order['maker_order_id'],
             max_fee=MAX_FEE,
             nonce = nonce + i
@@ -209,22 +242,9 @@ async def update_quotes(account: Account, market_cfg, remus_contract, to_be_canc
         if order['order_side'] == 'ask':
             target_token_address = market_cfg[1]['base_token']
             order_side = 'Ask'
-            token_contract = base_token_contract
         else:
             target_token_address = market_cfg[1]['quote_token']
             order_side = 'Bid'
-            token_contract = quote_token_contract
-    
-        approve_amount = order['amount'] if order_side == 'Bid' else order['amount'] * order['price'] / 10**base_decimals
-        if order_side == 'Bid':
-            approve_amount = 1000 * 10**base_decimals
-        await (await token_contract.functions['approve'].invoke_v1(
-            spender=int(REMUS_ADDRESS, 16),
-            amount = int(approve_amount),
-            max_fee=MAX_FEE,
-            nonce = nonce + len(to_be_canceled) + i * 2
-        )).wait_for_acceptance()
-        logging.info(f"Approving: {order['amount']}")
 
         logging.info(f"Soon to sumbit order: q: {order['amount']}, p: {order['price']}, s: {order_side}")
         await (await remus_contract.functions['submit_maker_order'].invoke_v1(
@@ -236,10 +256,34 @@ async def update_quotes(account: Account, market_cfg, remus_contract, to_be_canc
             order_type = ('Basic', None),
             time_limit = ('GTC', None),
             max_fee=MAX_FEE,
-            nonce = nonce + len(to_be_canceled) + i * 2 + 1
+            nonce = nonce + len(to_be_canceled) + i
         )).wait_for_acceptance()
         logging.info(f"Submitting order: q: {order['amount']}, p: {order['price']}, s: {order_side}")
     logging.info('Done with order changes')
+
+
+async def cancel_all_orders(account: Account, remus_contract):
+    """Cancel all open orders for the account."""
+    logging.info("Canceling all open orders...")
+    try:
+        my_orders = await remus_contract.functions['get_all_user_orders'].call(user=WALLET_ADDRESS)
+        if not my_orders[0]:
+            logging.info("No open orders to cancel")
+            return
+
+        nonce = await account.get_nonce()
+        for i, order in enumerate(my_orders[0]):
+            await (await remus_contract.functions['delete_maker_order'].invoke_v1(
+                maker_order_id=order['maker_order_id'],
+                max_fee=MAX_FEE,
+                nonce=nonce + i
+            )).wait_for_acceptance()
+            logging.info(f"Canceled order: {order['maker_order_id']}")
+        
+        logging.info("Successfully canceled all orders")
+    except Exception as e:
+        logging.error(f"Error while canceling orders: {e}")
+        raise
 
 
 async def async_main():
@@ -253,45 +297,65 @@ async def async_main():
     remus_contract = await Contract.from_address(address = REMUS_ADDRESS, provider = account)
     all_remus_cfgs = await remus_contract.functions['get_all_market_configs'].call()
     
-    while True:
-        await asyncio.sleep(1)  # Example async operation
-        for market_id in [x[0] for x in all_remus_cfgs[0] if x[0] in MARKET_MAKER_CFG]:
-            try:
-                market_cfg, market_maker_cfg = get_market_cfg(all_remus_cfgs, market_id)
+    # Initialize contracts and set up approvals for the first market
+    for market_id in [x[0] for x in all_remus_cfgs[0] if x[0] in MARKET_MAKER_CFG]:
+        market_cfg, market_maker_cfg = get_market_cfg(all_remus_cfgs, market_id)
+        base_token_contract = await Contract.from_address(address = market_cfg[1]['base_token'], provider = account)
+        quote_token_contract = await Contract.from_address(address = market_cfg[1]['quote_token'], provider = account)
+        await setup_unlimited_approvals(account, remus_contract, market_cfg, base_token_contract, quote_token_contract)
+    
+        while True:
+            await asyncio.sleep(1)  # Example async operation
+            for market_id in [x[0] for x in all_remus_cfgs[0] if x[0] in MARKET_MAKER_CFG]:
+                try:
+                    market_cfg, market_maker_cfg = get_market_cfg(all_remus_cfgs, market_id)
 
-                # 1) Claim tokens
-                # TODO ideally the claim would happen after the order deletion.
-                await claim_tokens(market_cfg, remus_contract)
+                    # 1) Claim tokens
+                    # TODO ideally the claim would happen after the order deletion.
+                    await claim_tokens(market_cfg, remus_contract)
 
-                # 2) Get prices
-                r = requests.get(SOURCE_DATA[market_id])
-                fair_price = float(sorted(r.json(), key = lambda x: x['T'])[-1]['p'])
-                logging.info(f'Fair price queried: {fair_price}.')
+                    # 2) Get prices
+                    r = requests.get(SOURCE_DATA[market_id])
+                    data = r.json()
+                    trades = sorted(data, key = lambda x: x['T'])
+                    fair_price = float(trades[-1]['p'])
+                    abs_return = abs(float(trades[-1]['p']) / float(trades[0]['p']) - 1)
+                    spread = max(market_maker_cfg['min_distance_from_FP'], abs_return)
 
-                # 3) Get orders
-                my_orders = await remus_contract.functions['get_all_user_orders'].call(user=WALLET_ADDRESS)
+                    logging.info(f'Fair price queried: {fair_price}.')
 
-                bids = [x for x in my_orders[0] if x['market_id'] == market_id and x['order_side'].variant == 'Bid']
-                asks = [x for x in my_orders[0] if x['market_id'] == market_id and x['order_side'].variant == 'Ask']
-                logging.debug(f'My remaining orders queried: {bids}, {asks}.')
+                    # 3) Get orders
+                    my_orders = await remus_contract.functions['get_all_user_orders'].call(user=WALLET_ADDRESS)
 
-                # 4) Get position (balance of + open orders)
-                base_token_contract = await Contract.from_address(address = market_cfg[1]['base_token'], provider = account)
-                quote_token_contract = await Contract.from_address(address = market_cfg[1]['quote_token'], provider = account)
-                total_possible_position_base, total_possible_position_quote = await get_position(
-                    market_cfg, account, asks, bids, base_token_contract, quote_token_contract
-                )
+                    bids = [x for x in my_orders[0] if x['market_id'] == market_id and x['order_side'].variant == 'Bid']
+                    asks = [x for x in my_orders[0] if x['market_id'] == market_id and x['order_side'].variant == 'Ask']
+                    logging.debug(f'My remaining orders queried: {bids}, {asks}.')
 
-                # 5) Calculate optimal quotes
-                to_be_canceled, to_be_created = get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price)
+                    # 4) Get position (balance of + open orders)
+                    base_token_contract = await Contract.from_address(address = market_cfg[1]['base_token'], provider = account)
+                    quote_token_contract = await Contract.from_address(address = market_cfg[1]['quote_token'], provider = account)
+                    total_possible_position_base, total_possible_position_quote = await get_position(
+                        market_cfg, account, asks, bids, base_token_contract, quote_token_contract
+                    )
 
-                # 6) update quotes
-                await update_quotes(account, market_cfg, remus_contract, to_be_canceled, to_be_created, base_token_contract, quote_token_contract)
-                
-                logging.info("Application running successfully.")
-            except Exception as e:
-                logging.error("An error occurred: %s", str(e), exc_info=True)
-                # sys.exit(1)
+                    # 5) Calculate optimal quotes
+                    to_be_canceled, to_be_created = await get_optimal_quotes(asks, bids, market_maker_cfg, market_cfg, fair_price, total_possible_position_base, total_possible_position_quote, spread)
+
+                    # 6) update quotes
+                    await update_quotes(account, market_cfg, remus_contract, to_be_canceled, to_be_created, base_token_contract, quote_token_contract)
+                except asyncio.CancelledError:
+                    pass
+                except KeyboardInterrupt:
+                    logging.info("Application stopped by user")
+                    return
+                except Exception as e:
+                    logging.error("An error occurred: %s", str(e), exc_info=True)
+                    # sys.exit(1)
+                finally:
+                    await cancel_all_orders(account, remus_contract)
 
 if __name__ == "__main__":
-    asyncio.run(async_main())
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        logging.info("Application stopped by user #2")
